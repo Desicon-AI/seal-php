@@ -1,0 +1,30 @@
+{
+    "name": "desicon/seal",
+    "description": "Seal Security & SRE Engine for PHP and Laravel",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Desicon",
+            "email": "support+seal@desicon.ai",
+            "homepage": "https://seal.desicon.ai/"
+        }
+    ],
+    "require": {
+        "php": ">=7.4",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Desicon\\Seal\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Desicon\\Seal\\Laravel\\SealServiceProvider"
+            ]
+        }
+    }
+}
