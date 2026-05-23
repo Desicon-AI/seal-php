@@ -75,7 +75,7 @@ class Client
     {
         if (!self::$apiKey) return;
 
-        $tempFile = sys_get_temp_dir() . '/seal_last_heartbeat_' . md5(self::$appName) . '.txt';
+        $tempFile = __DIR__ . '/seal_last_heartbeat_' . md5(self::$appName) . '.txt';
         $now = time();
 
         // If file doesn't exist, or it has been > 60 seconds since last heartbeat
@@ -192,16 +192,28 @@ class Client
 
         if (preg_match($sqliRegex, $uri)) {
             self::reportThreat('SQL_INJECTION', $ip, []);
+            http_response_code(403);
+            die("Desicon Seal WAF: Malicious SQL Payload Blocked.");
         } elseif (preg_match($xssRegex, $uri)) {
             self::reportThreat('XSS_ATTACK', $ip, []);
+            http_response_code(403);
+            die("Desicon Seal WAF: Malicious XSS Payload Blocked.");
         }
 
         // Fast payload check (POST body)
         if ($contentLength > 0 && $contentLength < 100000) {
             $body = file_get_contents('php://input');
             if ($body) {
-                if (preg_match($sqliRegex, $body)) self::reportThreat('SQL_INJECTION', $ip, []);
-                elseif (preg_match($xssRegex, $body)) self::reportThreat('XSS_ATTACK', $ip, []);
+                if (preg_match($sqliRegex, $body)) {
+                    self::reportThreat('SQL_INJECTION', $ip, []);
+                    http_response_code(403);
+                    die("Desicon Seal WAF: Malicious SQL Payload Blocked.");
+                }
+                elseif (preg_match($xssRegex, $body)) {
+                    self::reportThreat('XSS_ATTACK', $ip, []);
+                    http_response_code(403);
+                    die("Desicon Seal WAF: Malicious XSS Payload Blocked.");
+                }
             }
         }
     }
@@ -324,8 +336,13 @@ class Client
 
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         
-        // Timeout of 100ms. We don't care about the response, we just want to fire it off.
-        curl_setopt($ch, CURLOPT_TIMEOUT_MS, 100);
+        // Use full seconds instead of MS for older cPanel versions
+        curl_setopt($ch, CURLOPT_TIMEOUT, 2); 
+        
+        // Bypass cPanel's strict/outdated SSL certificate verification
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+
         curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
 
         curl_exec($ch);
