@@ -33,6 +33,8 @@ class SealServiceProvider extends ServiceProvider
         if ($apiKey) {
             Client::init([
                 'apiKey' => $apiKey,
+                'signingSecret' => config('seal.signing_secret', env('SEAL_SIGNING_SECRET')),
+                'endpoint' => config('seal.endpoint', 'https://sealengine.desicon.ai/api/v1/ingest'),
                 'appName' => config('app.name', 'laravel-app'),
                 'environment' => config('app.env', 'production'),
                 // Developers can publish a seal.php config to customize the WAF

@@ -38,12 +38,17 @@ class HeartbeatCommand extends Command
         // Initialize Client so that static variables are populated
         Client::init([
             'apiKey' => $apiKey,
+                'signingSecret' => config('seal.signing_secret', env('SEAL_SIGNING_SECRET')),
+                'endpoint' => config('seal.endpoint', 'https://sealengine.desicon.ai/api/v1/ingest'),
             'appName' => config('app.name', 'laravel-app'),
             'environment' => config('app.env', 'production'),
         ]);
 
         // Dispatch the heartbeat explicitly as 'server_cron'
-        Client::sendCronHeartbeat();
+        if (!Client::sendCronHeartbeat()) {
+            $this->error('Seal heartbeat delivery was not acknowledged.');
+            return 1;
+        }
 
         $this->info('Seal Heartbeat sent successfully.');
         return 0;

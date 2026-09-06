@@ -1,0 +1,11 @@
+name: SDK contract tests
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: php -l src/Client.php
+      - run: php tests/contract.php

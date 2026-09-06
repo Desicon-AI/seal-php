@@ -12,9 +12,13 @@ class Client
     private static $wafConfig = [];
     private static $startTime;
     private static $initialized = false;
+    public static $heartbeatDeliveryOK = null;
 
     // Default WAF Config
     private static $defaultWaf = [
+        'trustProxyHeaders' => false,
+        'sqli' => ['action' => 'report'],
+        'xss' => ['action' => 'report'],
         'geoBlocking' => ['blockedCountries' => [], 'action' => 'report'],
         'maliciousScanners' => ['action' => 'report'],
         'methodTampering' => ['action' => 'report'],
@@ -48,11 +52,6 @@ class Client
 
         if (!self::$apiKey) {
             error_log("[Seal] Missing API Key. Crashes will not be reported.");
-        } else {
-            // Ping the backend to auto-resolve old errors on startup
-            $pingUrl = self::$endpoint . '/ping';
-            // Simple fire-and-forget for ping
-            self::sendAsyncPayload($pingUrl, null);
         }
 
         // 1. Hook PHP Error & Exception Handlers
@@ -61,29 +60,9 @@ class Client
         register_shutdown_function([__CLASS__, 'handleFatalError']);
 
         // 2. Execute Zero-Latency WAF
-        self::runSecurityEngine();
+        if (PHP_SAPI !== 'cli') self::runSecurityEngine();
 
-        // 3. Traffic-Triggered Heartbeat (Zero Server Setup)
-        self::sendHeartbeatIfRequired();
-    }
-
-    /**
-     * "Poor Man's Cron" - Uses standard web traffic to trigger the heartbeat.
-     * Prevents the need for server cron jobs.
-     */
-    private static function sendHeartbeatIfRequired()
-    {
-        if (!self::$apiKey) return;
-
-        $tempFile = __DIR__ . '/seal_last_heartbeat_' . md5(self::$appName) . '.txt';
-        $now = time();
-
-        // If file doesn't exist, or it has been > 60 seconds since last heartbeat
-        if (!file_exists($tempFile) || ($now - filemtime($tempFile)) > 60) {
-            // Update the modified time immediately to prevent race conditions from other concurrent requests
-            touch($tempFile);
-            self::sendHeartbeatPayload('web_traffic');
-        }
+        // Liveness requires an independent cron/scheduler, not incoming web traffic.
     }
 
     /**
@@ -93,7 +72,7 @@ class Client
     public static function sendCronHeartbeat()
     {
         if (!self::$apiKey) return;
-        self::sendHeartbeatPayload('server_cron');
+        return self::sendHeartbeatPayload('server_cron');
     }
 
     private static function sendHeartbeatPayload($source)
@@ -104,7 +83,8 @@ class Client
             'started_at' => self::$startTime,
             'source' => $source
         ];
-        self::sendAsyncPayload(self::$endpoint . '/heartbeat', $payload);
+        self::$heartbeatDeliveryOK = self::sendAsyncPayload(self::auxiliaryEndpoint('/heartbeat'), $payload);
+        return self::$heartbeatDeliveryOK;
     }
 
     public static function registerDeployment($version = "unknown")
@@ -116,16 +96,17 @@ class Client
             'environment' => self::$environment
         ];
 
-        // Replace /ingest with /deployment in URL
-        $deploymentUrl = str_replace('/ingest', '/deployment', self::$endpoint);
-        $deploymentUrl = str_replace('/api/v1/sandbox/deployment', '/api/v1/deployment', $deploymentUrl);
+        $deploymentUrl = self::auxiliaryEndpoint('/deployment');
 
         self::sendAsyncPayload($deploymentUrl, $payload);
     }
 
     private static function runSecurityEngine()
     {
-        $ip = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        if (!empty(self::$wafConfig['trustProxyHeaders'])) {
+            $ip = trim(explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $ip)[0]);
+        }
         $uri = $_SERVER['REQUEST_URI'] ?? '';
         $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
         $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
@@ -133,10 +114,11 @@ class Client
         $contentLength = isset($_SERVER['CONTENT_LENGTH']) ? (int)$_SERVER['CONTENT_LENGTH'] : 0;
 
         $waf = self::$wafConfig;
+        if (empty($waf['trustProxyHeaders'])) $cfCountry = null;
 
         // Geo-Blocking
         if (!empty($waf['geoBlocking']['blockedCountries']) && $cfCountry && in_array($cfCountry, $waf['geoBlocking']['blockedCountries'])) {
-            self::reportThreat('GEO_BLOCKED', $ip, ['country' => $cfCountry]);
+            self::reportThreat('GEO_BLOCKED', $ip, ['country' => $cfCountry, 'action' => $waf['geoBlocking']['action'] === 'drop' ? 'blocked' : 'observed']);
             if ($waf['geoBlocking']['action'] === 'drop') {
                 http_response_code(403);
                 die("Access Denied from your Region");
@@ -146,7 +128,7 @@ class Client
         // Method Tampering
         $allowedMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'];
         if ($waf['methodTampering']['action'] === 'drop' && !in_array($method, $allowedMethods)) {
-            self::reportThreat('METHOD_TAMPERING', $ip, ['method' => $method]);
+            self::reportThreat('METHOD_TAMPERING', $ip, ['action' => 'blocked']);
             if ($waf['methodTampering']['action'] === 'drop') {
                 http_response_code(405);
                 die("Method Not Allowed");
@@ -154,8 +136,8 @@ class Client
         }
 
         // Malicious Scanners
-        if ($waf['maliciousScanners']['action'] === 'drop' && preg_match('/(sqlmap|nikto|masscan|zmap|nmap|python-requests|curl|wget)/i', $ua)) {
-            self::reportThreat('MALICIOUS_SCANNER', $ip, ['user_agent' => $ua]);
+        if ($waf['maliciousScanners']['action'] === 'drop' && preg_match('/(sqlmap|nikto|masscan|zmap|nmap)/i', $ua)) {
+            self::reportThreat('MALICIOUS_SCANNER', $ip, ['action' => 'blocked']);
             if ($waf['maliciousScanners']['action'] === 'drop') {
                 http_response_code(403);
                 die("Forbidden Scanner");
@@ -164,7 +146,7 @@ class Client
 
         // Payload Overflow
         if ($waf['payloadOverflow']['action'] === 'drop' && $contentLength > $waf['payloadOverflow']['maxPayloadSize']) {
-            self::reportThreat('PAYLOAD_OVERFLOW', $ip, ['content_length' => $contentLength]);
+            self::reportThreat('PAYLOAD_OVERFLOW', $ip, ['action' => 'blocked']);
             if ($waf['payloadOverflow']['action'] === 'drop') {
                 http_response_code(413);
                 die("Payload Too Large");
@@ -173,7 +155,7 @@ class Client
 
         // Path Traversal
         if ($waf['pathTraversal']['action'] === 'drop' && preg_match('/(?:\.\.\/|\.\.\\\|%2e%2e%2f|%2e%2e%5c)/i', $uri)) {
-            self::reportThreat('PATH_TRAVERSAL', $ip, []);
+            self::reportThreat('PATH_TRAVERSAL', $ip, ['action' => 'blocked']);
             if ($waf['pathTraversal']['action'] === 'drop') {
                 http_response_code(403);
                 die("Forbidden Path");
@@ -187,17 +169,21 @@ class Client
         }
 
         // SQLi & XSS Inspection
-        $sqliRegex = "/(?:\b(ALTER|CREATE|DELETE|DROP|EXEC(UTE){0,1}|INSERT( +INTO){0,1}|MERGE|SELECT|UPDATE|UNION( +ALL){0,1})\b)|(?:'|%27).*?(?:OR|AND).*?(?:'|%27)|(?:--)/i";
+        $sqliRegex = '/\bUNION\s+(?:ALL\s+)?SELECT\b/i';
         $xssRegex = "/(?:<|%3C)script[\s\S]*?(?:>|%3E)|(?:<|%3C)[\s\S]*?(?:on[a-z]+\s*=)(?:>|%3E)/i";
 
         if (preg_match($sqliRegex, $uri)) {
-            self::reportThreat('SQL_INJECTION', $ip, []);
-            http_response_code(403);
-            die("Desicon Seal WAF: Malicious SQL Payload Blocked.");
+            self::reportThreat('SQL_INJECTION', $ip, ['action' => $waf['sqli']['action'] === 'drop' ? 'blocked' : 'observed']);
+            if ($waf['sqli']['action'] === 'drop') {
+                http_response_code(403);
+                die("Desicon Seal WAF: Request blocked by configured policy.");
+            }
         } elseif (preg_match($xssRegex, $uri)) {
-            self::reportThreat('XSS_ATTACK', $ip, []);
-            http_response_code(403);
-            die("Desicon Seal WAF: Malicious XSS Payload Blocked.");
+            self::reportThreat('XSS_ATTACK', $ip, ['action' => $waf['xss']['action'] === 'drop' ? 'blocked' : 'observed']);
+            if ($waf['xss']['action'] === 'drop') {
+                http_response_code(403);
+                die("Desicon Seal WAF: Request blocked by configured policy.");
+            }
         }
 
         // Fast payload check (POST body)
@@ -205,14 +191,18 @@ class Client
             $body = file_get_contents('php://input');
             if ($body) {
                 if (preg_match($sqliRegex, $body)) {
-                    self::reportThreat('SQL_INJECTION', $ip, []);
-                    http_response_code(403);
-                    die("Desicon Seal WAF: Malicious SQL Payload Blocked.");
+                    self::reportThreat('SQL_INJECTION', $ip, ['action' => $waf['sqli']['action'] === 'drop' ? 'blocked' : 'observed']);
+                    if ($waf['sqli']['action'] === 'drop') {
+                http_response_code(403);
+                die("Desicon Seal WAF: Request blocked by configured policy.");
+            }
                 }
                 elseif (preg_match($xssRegex, $body)) {
-                    self::reportThreat('XSS_ATTACK', $ip, []);
-                    http_response_code(403);
-                    die("Desicon Seal WAF: Malicious XSS Payload Blocked.");
+                    self::reportThreat('XSS_ATTACK', $ip, ['action' => $waf['xss']['action'] === 'drop' ? 'blocked' : 'observed']);
+                    if ($waf['xss']['action'] === 'drop') {
+                http_response_code(403);
+                die("Desicon Seal WAF: Request blocked by configured policy.");
+            }
                 }
             }
         }
@@ -229,12 +219,13 @@ class Client
             'threat_type' => $threatType,
             'context' => array_merge([
                 'method' => $_SERVER['REQUEST_METHOD'] ?? '',
-                'url' => $_SERVER['REQUEST_URI'] ?? '',
+                'path_hash' => hash('sha256', explode('?', $_SERVER['REQUEST_URI'] ?? '')[0]),
+                'action' => 'observed',
             ], $details)
         ];
 
         // Hacky way to inject /threat into endpoint
-        $endpoint = str_replace('/ingest', '/ingest/threat', self::$endpoint);
+        $endpoint = self::auxiliaryEndpoint('/threat');
         self::sendAsyncPayload($endpoint, $payload);
     }
 
@@ -305,8 +296,13 @@ class Client
     }
 
     /**
-     * Fire-and-forget cURL request (adds 0 latency to the PHP page load)
+     * Bounded synchronous cURL delivery. This may add up to two seconds to a request.
      */
+    private static function auxiliaryEndpoint($suffix)
+    {
+        return str_replace('/sandbox/ingest', '/ingest', rtrim(self::$endpoint, '/')) . $suffix;
+    }
+
     private static function sendAsyncPayload($url, $payload)
     {
         $ch = curl_init($url);
@@ -339,13 +335,20 @@ class Client
         // Use full seconds instead of MS for older cPanel versions
         curl_setopt($ch, CURLOPT_TIMEOUT, 2); 
         
-        // Bypass cPanel's strict/outdated SSL certificate verification
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        // Require a valid server certificate and hostname.
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
 
         curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
 
-        curl_exec($ch);
+        $result = curl_exec($ch);
+        $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
+        if ($result === false || $status < 200 || $status >= 300) return false;
+        if (substr($url, -10) === '/heartbeat') {
+            $ack = json_decode($result, true);
+            return is_array($ack) && ($ack['status'] ?? null) === 'ok';
+        }
+        return true;
     }
 }
