@@ -18,6 +18,7 @@ class Client
     private static $defaultWaf = [
         'trustProxyHeaders' => false,
         'sqli' => ['action' => 'report'],
+        'honeypot' => ['action' => 'report'],
         'xss' => ['action' => 'report'],
         'geoBlocking' => ['blockedCountries' => [], 'action' => 'report'],
         'maliciousScanners' => ['action' => 'report'],
@@ -165,20 +166,26 @@ class Client
         // Honeypot
         $honeypots = ['/wp-admin', '/wp-login.php', '/.env', '/config.php', '/.git/config'];
         if (in_array(explode('?', $uri)[0], $honeypots)) {
-            self::reportThreat('HONEYPOT_ACCESS', $ip, []);
+            $action = $waf['honeypot']['action'] ?? 'report';
+            self::reportThreat('HONEYPOT_ACCESS', $ip, ['action' => $action === 'drop' ? 'blocked' : 'observed']);
+            if ($action === 'drop') {
+                http_response_code(403);
+                die('Access denied by configured path policy');
+            }
         }
 
         // SQLi & XSS Inspection
         $sqliRegex = '/\bUNION\s+(?:ALL\s+)?SELECT\b/i';
         $xssRegex = "/(?:<|%3C)script[\s\S]*?(?:>|%3E)|(?:<|%3C)[\s\S]*?(?:on[a-z]+\s*=)(?:>|%3E)/i";
 
-        if (preg_match($sqliRegex, $uri)) {
+        $inspectedUri = rawurldecode($uri);
+        if (preg_match($sqliRegex, $inspectedUri)) {
             self::reportThreat('SQL_INJECTION', $ip, ['action' => $waf['sqli']['action'] === 'drop' ? 'blocked' : 'observed']);
             if ($waf['sqli']['action'] === 'drop') {
                 http_response_code(403);
                 die("Desicon Seal WAF: Request blocked by configured policy.");
             }
-        } elseif (preg_match($xssRegex, $uri)) {
+        } elseif (preg_match($xssRegex, $inspectedUri)) {
             self::reportThreat('XSS_ATTACK', $ip, ['action' => $waf['xss']['action'] === 'drop' ? 'blocked' : 'observed']);
             if ($waf['xss']['action'] === 'drop') {
                 http_response_code(403);

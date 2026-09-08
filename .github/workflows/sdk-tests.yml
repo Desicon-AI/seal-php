@@ -9,3 +9,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: php -l src/Client.php
       - run: php tests/contract.php
+      - run: |
+          for rule in honeypot sqli xss; do
+            php tests/enforcement.php "$rule" report
+            php tests/enforcement.php "$rule" drop
+          done
