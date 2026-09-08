@@ -1,6 +1,8 @@
 <?php
 namespace Desicon\Seal;
+ob_start();
 require __DIR__.'/contract.php';
+ob_clean();
 $rule=$argv[1]; $action=$argv[2];
 $paths=['honeypot'=>'/.env','sqli'=>'/?q=UNION%20SELECT','xss'=>'/?q=%3Cscript%3E'];
 $types=['honeypot'=>'HONEYPOT_ACCESS','sqli'=>'SQL_INJECTION','xss'=>'XSS_ATTACK'];
